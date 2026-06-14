@@ -10,6 +10,14 @@ class Settings(BaseSettings):
     # use the admin_ids property for the parsed list.
     ADMIN_IDS: str
 
+    # Azure OpenAI image generation/editing (gpt-image-2 deployment).
+    AZURE_OPENAI_ENDPOINT_IMAGE: str
+    AZURE_OPENAI_API_KEY_IMAGE: str
+    AZURE_OPENAI_DEPLOYMENT_IMAGE: str = "gpt-image-2"
+    # The Images Edit endpoint requires this version; older ones (e.g.
+    # 2024-12-01-preview) return 404 for /images/edits.
+    AZURE_OPENAI_API_VERSION: str = "2025-04-01-preview"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
