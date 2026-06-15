@@ -1,14 +1,18 @@
+import logging
+
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from openai import OpenAIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.queries import (
@@ -19,7 +23,10 @@ from app.database.queries import (
     get_movie_by_code,
     remove_channel,
 )
-from app.states.admin_fsm import AddChannelFSM, AddMovieFSM
+from app.services.image import MAX_EDIT_IMAGES, edit_image, generate_image
+from app.states.admin_fsm import AddChannelFSM, AddMovieFSM, ImageFSM
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="admin")
 
@@ -77,12 +84,46 @@ NO_CHANNELS_TEXT = "Hozircha kanallar yo'q."
 ASK_REMOVE_CHANNEL_TEXT = "❌ O'chirish uchun kanalni tanlang:"
 CHANNEL_REMOVED_TEXT = "✅ Kanal o'chirildi."
 
+# --- AI Image generation / editing ---------------------------------------
+ASK_GEN_PROMPT_TEXT = (
+    "🎨 Rasm uchun tavsif (prompt) yuboring.\n\n"
+    "Masalan: <i>Tokio shahridagi tungi ko'cha, neon chiroqlar, kinematik yorug'lik, "
+    "fotorealistik</i>"
+)
+ASK_EDIT_INPUT_TEXT = (
+    "🖌 Tahrirlash uchun 1 yoki bir nechta rasm yuboring "
+    "(eng ko'pi {max} ta), so'ng nima qilish kerakligini matn (prompt) bilan yuboring.\n\n"
+    "Masalan: <i>Fonni zamonaviy ofisga almashtir. Insonni o'zgartirma. "
+    "Professional yorug'lik.</i>"
+).format(max=MAX_EDIT_IMAGES)
+EDIT_IMAGE_RECEIVED_TEXT = (
+    "✅ Rasm qabul qilindi ({count} ta). Yana rasm yuboring "
+    "yoki tahrirlash uchun matn (prompt) yuboring."
+)
+EDIT_MAX_IMAGES_TEXT = (
+    "⚠️ Eng ko'pi {max} ta rasm. Tahrirlash uchun matn (prompt) yuboring."
+).format(max=MAX_EDIT_IMAGES)
+EDIT_NO_IMAGE_YET_TEXT = "Avval kamida bitta rasm yuboring."
+EDIT_SEND_PROMPT_TEXT = "Matn (prompt) yoki rasm yuboring."
+GENERATING_TEXT = "⏳ Rasm yaratilmoqda... (30–60 soniya)"
+EDITING_TEXT = "⏳ Rasm tahrirlanmoqda... (30–60 soniya)"
+IMAGE_ERROR_TEXT = (
+    "❌ Rasmni yaratib bo'lmadi. Promptni o'zgartirib qayta urinib ko'ring "
+    "(noo'rin yoki taqiqlangan kontent rad etilishi mumkin)."
+)
+RESULT_GEN_CAPTION = "🎨 Tayyor!\n\n{prompt}"
+RESULT_EDIT_CAPTION = "🖌 Tahrirlandi!\n\n{prompt}"
+# Telegram caption hard limit is 1024 chars; keep prompt well under it.
+_CAPTION_PROMPT_LIMIT = 800
+
 # --- Callback data --------------------------------------------------------
 CB_STATS = "admin_stats"
 CB_ADD_MOVIE = "admin_add_movie"
 CB_ADD_CHANNEL = "admin_add_channel"
 CB_REMOVE_CHANNEL = "admin_remove_channel"
 CB_DELETE_CHANNEL_PREFIX = "admin_del_ch:"
+CB_GEN_IMAGE = "admin_gen_image"
+CB_EDIT_IMAGE = "admin_edit_image"
 
 
 def _build_dashboard_keyboard() -> InlineKeyboardMarkup:
@@ -100,12 +141,24 @@ def _build_dashboard_keyboard() -> InlineKeyboardMarkup:
             text="❌ Kanal o'chirish", callback_data=CB_REMOVE_CHANNEL
         )
     )
+    builder.row(
+        InlineKeyboardButton(text="🎨 Rasm yaratish", callback_data=CB_GEN_IMAGE)
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🖌 Rasmni tahrirlash", callback_data=CB_EDIT_IMAGE
+        )
+    )
     return builder.as_markup()
 
 
 @router.message(Command("admin"))
-async def cmd_admin(message: Message, session: AsyncSession) -> None:
+async def cmd_admin(
+    message: Message, session: AsyncSession, state: FSMContext
+) -> None:
     """Show the admin dashboard with summary stats."""
+    # Always reset any half-finished flow so /admin is a clean entry point.
+    await state.clear()
     stats = await get_admin_stats(session)
     await message.answer(
         DASHBOARD_TEXT.format(**stats),
@@ -280,3 +333,135 @@ async def cb_delete_channel(callback: CallbackQuery, session: AsyncSession) -> N
     await remove_channel(session, channel_id)
     await callback.message.answer(CHANNEL_REMOVED_TEXT)
     await callback.answer()
+
+
+# --- AI Image: generate from a prompt -------------------------------------
+def _caption(template: str, prompt: str) -> str:
+    """Format a result caption, truncating the prompt to Telegram's limit."""
+    trimmed = prompt[:_CAPTION_PROMPT_LIMIT]
+    if len(prompt) > _CAPTION_PROMPT_LIMIT:
+        trimmed += "…"
+    return template.format(prompt=trimmed)
+
+
+@router.callback_query(F.data == CB_GEN_IMAGE)
+async def cb_gen_image(callback: CallbackQuery, state: FSMContext) -> None:
+    """Begin the text-to-image flow."""
+    await state.set_state(ImageFSM.waiting_for_gen_prompt)
+    await callback.message.answer(ASK_GEN_PROMPT_TEXT, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(
+    StateFilter(ImageFSM.waiting_for_gen_prompt),
+    F.text & ~F.text.startswith("/"),
+)
+async def process_gen_prompt(
+    message: Message, state: FSMContext, bot: Bot
+) -> None:
+    """Generate an image from the admin's prompt and send it back."""
+    prompt = message.text.strip()
+    await state.clear()
+
+    status = await message.answer(GENERATING_TEXT)
+    await bot.send_chat_action(message.chat.id, "upload_photo")
+    try:
+        png = await generate_image(prompt)
+    except OpenAIError as exc:
+        logger.exception("Image generation failed: %s", exc)
+        await status.edit_text(IMAGE_ERROR_TEXT)
+        return
+
+    await status.delete()
+    await message.answer_photo(
+        BufferedInputFile(png, filename="generated.png"),
+        caption=_caption(RESULT_GEN_CAPTION, prompt),
+    )
+
+
+@router.message(StateFilter(ImageFSM.waiting_for_gen_prompt))
+async def gen_prompt_fallback(message: Message) -> None:
+    """Nudge the admin to send a text prompt for generation."""
+    await message.answer(ASK_GEN_PROMPT_TEXT, parse_mode="HTML")
+
+
+# --- AI Image: edit one or more reference images --------------------------
+def _extract_image_file_id(message: Message) -> str | None:
+    """Return the file_id of an image sent as a photo or image document."""
+    if message.photo:
+        return message.photo[-1].file_id
+    document = message.document
+    if document is not None and (document.mime_type or "").startswith("image/"):
+        return document.file_id
+    return None
+
+
+@router.callback_query(F.data == CB_EDIT_IMAGE)
+async def cb_edit_image(callback: CallbackQuery, state: FSMContext) -> None:
+    """Begin the image-edit flow."""
+    await state.set_state(ImageFSM.waiting_for_edit_input)
+    await state.update_data(edit_file_ids=[])
+    await callback.message.answer(ASK_EDIT_INPUT_TEXT, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(
+    StateFilter(ImageFSM.waiting_for_edit_input),
+    F.photo | F.document,
+)
+async def process_edit_image(message: Message, state: FSMContext) -> None:
+    """Collect a reference image to be edited."""
+    file_id = _extract_image_file_id(message)
+    if file_id is None:
+        await message.answer(EDIT_SEND_PROMPT_TEXT)
+        return
+
+    data = await state.get_data()
+    file_ids: list[str] = data.get("edit_file_ids", [])
+    if len(file_ids) >= MAX_EDIT_IMAGES:
+        await message.answer(EDIT_MAX_IMAGES_TEXT)
+        return
+
+    file_ids.append(file_id)
+    await state.update_data(edit_file_ids=file_ids)
+    await message.answer(EDIT_IMAGE_RECEIVED_TEXT.format(count=len(file_ids)))
+
+
+@router.message(
+    StateFilter(ImageFSM.waiting_for_edit_input),
+    F.text & ~F.text.startswith("/"),
+)
+async def process_edit_prompt(
+    message: Message, state: FSMContext, bot: Bot
+) -> None:
+    """Run the edit using the collected images and the admin's prompt."""
+    data = await state.get_data()
+    file_ids: list[str] = data.get("edit_file_ids", [])
+    if not file_ids:
+        await message.answer(EDIT_NO_IMAGE_YET_TEXT)
+        return
+
+    prompt = message.text.strip()
+    await state.clear()
+
+    status = await message.answer(EDITING_TEXT)
+    await bot.send_chat_action(message.chat.id, "upload_photo")
+    try:
+        images = [(await bot.download(file_id)).read() for file_id in file_ids]
+        png = await edit_image(images, prompt)
+    except (OpenAIError, TelegramAPIError) as exc:
+        logger.exception("Image edit failed: %s", exc)
+        await status.edit_text(IMAGE_ERROR_TEXT)
+        return
+
+    await status.delete()
+    await message.answer_photo(
+        BufferedInputFile(png, filename="edited.png"),
+        caption=_caption(RESULT_EDIT_CAPTION, prompt),
+    )
+
+
+@router.message(StateFilter(ImageFSM.waiting_for_edit_input))
+async def edit_input_fallback(message: Message) -> None:
+    """Guide the admin when they send neither an image nor a prompt."""
+    await message.answer(EDIT_SEND_PROMPT_TEXT)
