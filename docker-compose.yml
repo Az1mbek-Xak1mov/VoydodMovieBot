@@ -1,3 +1,15 @@
+# The project name is fixed so container and volume names do not depend on the
+# checkout's directory (production lives in /opt/voydodmoviebot).
+name: voydodmoviebot
+
+# The production host has no global Docker log limit, so every container caps
+# its own logs here.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:15-alpine
@@ -6,8 +18,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
-    ports:
-      - "5432:5432"
+    # No `ports:` on purpose. Docker publishes ports around the host firewall
+    # (ufw), so a published 5432 is open to the whole internet. The bot reaches
+    # the database by its service name on the compose network.
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -15,6 +28,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    mem_limit: 512m
+    logging: *logging
 
   bot:
     build: .
@@ -26,10 +41,9 @@ services:
       BOT_TOKEN: ${BOT_TOKEN}
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_IDS: ${ADMIN_IDS}
-      AZURE_OPENAI_ENDPOINT_IMAGE: ${AZURE_OPENAI_ENDPOINT_IMAGE}
-      AZURE_OPENAI_API_KEY_IMAGE: ${AZURE_OPENAI_API_KEY_IMAGE}
-      AZURE_OPENAI_DEPLOYMENT_IMAGE: ${AZURE_OPENAI_DEPLOYMENT_IMAGE}
-      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION}
+    # The bot only handles Telegram file_ids, never the videos themselves.
+    mem_limit: 256m
+    logging: *logging
 
 volumes:
   pgdata:

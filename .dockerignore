@@ -1,0 +1,21 @@
+# The Dockerfile does `COPY . .`, so without this the server's .env (bot token,
+# database password) would be baked into the image. The bot gets its settings
+# from docker-compose's `environment:` instead.
+.env
+*.env
+# The restore script's Telethon session grants full access to the admin's
+# Telegram account; it and the restore state never belong in an image.
+*.session
+*.session-journal
+restore_plan.json
+restore_done.txt
+scripts/
+
+.git
+.venv/
+venv/
+.idea/
+.vscode/
+.claude/
+__pycache__/
+*.py[cod]
