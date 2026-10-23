@@ -29,3 +29,9 @@ env/
 .mypy_cache/
 .coverage
 htmlcov/
+
+# Movie restore script (session = full access to the admin's Telegram account)
+*.session
+*.session-journal
+restore_plan.json
+restore_done.txt

@@ -44,3 +44,28 @@ The dashboard exposes inline buttons:
 Image work runs through `app/services/image.py`, a thin async wrapper around the
 Azure OpenAI `images.generate` / `images.edit` endpoints. Images are passed in
 memory — nothing is written to disk.
+
+## Restoring movies after losing the database
+
+Uploaded videos stay on Telegram's servers, so a lost database can be rebuilt
+from the admin's private chat with the bot. `scripts/restore_movies.py` logs in
+as that admin (Telethon user session), pairs each `✅ Film qo'shildi!`
+confirmation with its video, and re-sends the video to the bot **by reference**
+(no download or re-upload) with a `#restore {json}` caption.
+`app/handlers/restore.py` saves it under the bot's `file_id`.
+
+1. Deploy this bot version (same `BOT_TOKEN`) and keep it running.
+2. Get `api_id` / `api_hash` for the admin account at https://my.telegram.org.
+3. Run, on any machine:
+
+```bash
+pip install -r scripts/requirements.txt
+export TG_API_ID=... TG_API_HASH=...
+python scripts/restore_movies.py scan --bot @YourBot          # read-only, writes restore_plan.json
+python scripts/restore_movies.py send --bot @YourBot --limit 3  # test run
+python scripts/restore_movies.py send --bot @YourBot            # the rest, 5s apart
+```
+
+`send` is resumable (`restore_done.txt`) and marks a movie done only once the
+bot replies. Do not clear the admin's chat with the bot until it finishes.
+Delete `admin.session` afterwards; it grants full access to the account.
